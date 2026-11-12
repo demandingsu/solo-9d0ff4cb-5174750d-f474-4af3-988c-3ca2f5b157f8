@@ -92,6 +92,40 @@ class UnmatchedReference(BaseModel):
     kind: NoticeKind
 
 
+class ConflictSource(BaseModel):
+    """同编号冲突（或重复）详情的一个版本来源。"""
+
+    url: str = Field(..., description="该版本详情页 URL")
+    kind: NoticeKind
+    route: str | None
+    suspend_start: datetime | None
+    suspend_end: datetime | None
+    published_at: datetime
+    references: list[str] = Field(default_factory=list)
+
+
+class NoticeConflict(BaseModel):
+    """同编号多份详情的核对结果。"""
+
+    notice_id: str
+    conflicting_fields: list[str] = Field(
+        ..., description="内容不一致的字段：kind/route/suspend_start/suspend_end/published_at/references；空列表表示各版本一致（已合并）"
+    )
+    sources: list[ConflictSource] = Field(..., description="按 URL 排序的全部版本来源")
+
+
+class PendingVerification(BaseModel):
+    """因同编号详情冲突而无法给出确定停运结论的公告链。"""
+
+    root_id: str = Field(..., description="链的根公告编号")
+    route: str | None
+    chain: list[str] = Field(..., description="待核实链上的公告编号，根公告在前")
+    sources: list[str] = Field(..., description="链上各公告全部版本的详情页链接")
+    conflict_notice_ids: list[str] = Field(..., description="该链上存在内容冲突的公告编号")
+    conflicts: list[NoticeConflict] = Field(..., description="相关冲突的完整来源明细")
+    reason: str = Field("conflicting_duplicates", description="固定值：conflicting_duplicates")
+
+
 class QueryResponse(BaseModel):
     """查询结果。"""
 
@@ -103,4 +137,12 @@ class QueryResponse(BaseModel):
     active_suspensions: list[ActiveSuspension]
     inactive_chains: list[InactiveChain]
     unmatched_references: list[UnmatchedReference]
+    pending_verification: list[PendingVerification] = Field(
+        default_factory=list,
+        description="同编号详情存在冲突、需人工核实的公告链；这些链不输出确定停运结论",
+    )
+    duplicate_conflicts: list[NoticeConflict] = Field(
+        default_factory=list,
+        description="本次抓取发现的全部同编号多版本核对结果（含内容一致已合并的重复页）",
+    )
     skipped_offsite_links: list[str] = Field(default_factory=list)

@@ -68,5 +68,7 @@ async def query(req: QueryRequest) -> QueryResponse:
         active_suspensions=result.active,
         inactive_chains=result.inactive,
         unmatched_references=result.unmatched,
+        pending_verification=result.pending,
+        duplicate_conflicts=result.conflicts,
         skipped_offsite_links=crawl.skipped_offsite,
     )

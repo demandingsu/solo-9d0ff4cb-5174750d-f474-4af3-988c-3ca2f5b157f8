@@ -17,6 +17,8 @@
 | 同线路独立公告分别判断 | 每条根公告独立成链；示例中 12 路有两条同时有效的独立停运 |
 | 无法匹配的引用 | 被引用编号在整站不存在时收集到 `unmatched_references`，不影响其余判定 |
 | 同站限制 | 只沿协议+主机+端口一致的链接爬行，跨站链接跳过并在 `skipped_offsite_links` 返回 |
+| 同编号重复详情 | 按编号分组核对 `kind/route/停运起止/发布时间/引用编号`：全部一致则合并（来源 URL 全部保留），结论与分页抓取次序无关 |
+| 同编号详情冲突 | 任一字段不一致即冲突：该编号及更正/撤销关联链（两个版本各自指向的原公告两边都覆盖）进入 `pending_verification`，列出冲突来源，**不输出这些链的确定停运结论**；无关联的独立公告照常判定 |
 
 停运区间按半开 `[suspend_start, suspend_end)` 判定：查询时刻等于结束时刻即视为已失效。
 所有时间均要求带时区（ISO 8601 偏移），比较基于同一时间线瞬间。
@@ -25,16 +27,16 @@
 
 ```
 app/                 FastAPI 采集服务
-  app/models.py      Pydantic 模型（入参/出参/公告实体）
+  app/models.py      Pydantic 模型（入参/出参/公告实体/冲突与待核实模型）
   app/parser.py      BeautifulSoup 解析：分页 rel=next、详情链接、详情字段
   app/crawler.py     同站分页 + 详情抓取（httpx 异步，限量/去重/错误收集）
-  app/engine.py      公告链还原与有效性判定（纯函数，无 IO）
+  app/engine.py      公告链还原、同编号详情核对与有效性判定（纯函数，无 IO）
   app/main.py        POST /query、GET /health
   Dockerfile
 site/                本地示例公告站（数据驱动生成纯静态 HTML）
-  build_site.py      生成 html/（3 个列表页 + 13 条详情，覆盖全部场景）
+  build_site.py      生成 html/（5 个列表页 + 21 条详情，含同编号重复/冲突场景）
   Dockerfile         python -m http.server 托管静态站
-tests/               22 个单元/集成测试（pytest）
+tests/               单元/集成测试（pytest）
 demo/                本地与 Compose 演示脚本
 docker-compose.yml   api(8000) + notice-site(8080)
 ```
@@ -77,7 +79,7 @@ python3 -m venv --without-pip .venv
 
 | 公告 | 场景 | 判定结果 |
 | --- | --- | --- |
-| N-2026-001 | 12 路原始停运 | 有效 |
+| N-2026-001 | 12 路原始停运；另页刊出同编号、内容完全一致的重复详情 | 有效，两份来源 URL 合并保留；不计入冲突 |
 | N-2026-002 | 18 路停运已结束 | `expired` |
 | 003 → 006 → 010 | 25 路停运被两次更正（更正引用更正） | 有效，区间为 010 替换后的 11-10 ~ 11-20 |
 | 004 → 007 | 33 路停运被撤销 | `cancelled`，整条链失效 |
@@ -85,7 +87,24 @@ python3 -m venv --without-pip .venv
 | N-2026-008 | 5 路停运尚未开始 | `not_yet_effective` |
 | 009 → 011 | 40 路更正，且 011 误引用不存在的 N-2026-999 | 有效，同时报告悬空引用 |
 | N-2026-013 | 50 路整条公告查询时刻之后才发布 | `not_yet_effective` |
+| 014 → 015 | 60 路更正 015 的同编号详情在两页刊出，停运截止时间冲突 | `pending_verification`，不输出确定结论 |
+| 017 → 016 ← 018 | 016 的两份同编号详情分别引用 017 与 018（指向不同原公告） | 两条关联链均 `pending_verification` |
 | N-EXT-001 | 列表中的跨站链接 | 跳过，出现在 `skipped_offsite_links` |
+
+### 同编号详情核对与待核实
+
+`/query` 响应中与重复详情相关的两个字段：
+
+* `duplicate_conflicts`：本次抓取发现的全部同编号多版本核对结果。
+  内容一致的重复页不产生记录（静默合并）；冲突记录包含
+  `conflicting_fields`（`kind/route/suspend_start/suspend_end/published_at/references`
+  中不一致的字段）与 `sources`（每个版本的完整字段与详情页 URL）。
+* `pending_verification`：因冲突而无法给出确定结论的公告链。每条记录给出
+  `chain`（链上编号）、`sources`（链上全部版本的 URL）、`conflict_notice_ids`
+  及对应 `conflicts` 明细。这些链既不会出现在 `active_suspensions`，也不会
+  出现在 `inactive_chains` 中，需人工核实后再判定。
+
+核对以 URL 排序后的版本为确定性基准，因此调换列表分页次序不会改变任何结论。
 
 ## 接入真实站点
 

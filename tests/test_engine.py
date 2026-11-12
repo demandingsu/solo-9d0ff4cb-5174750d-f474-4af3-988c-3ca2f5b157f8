@@ -24,6 +24,7 @@ def make(
     start: str | None = None,
     end: str | None = None,
     refs: list[str] | None = None,
+    url: str | None = None,
 ) -> Announcement:
     return Announcement(
         notice_id=notice_id,
@@ -33,7 +34,7 @@ def make(
         suspend_end=parse_dt(end) if end else None,
         published_at=parse_dt(published),
         references=refs or [],
-        url=f"http://x/notices/{notice_id}.html",
+        url=url or f"http://x/notices/{notice_id}.html",
     )
 
 
@@ -189,3 +190,214 @@ def test_naive_datetime_rejected_by_model():
             published_at=parse_dt("2026-11-11T10:00:00"),  # 无时区
             references=[], url="http://x", title=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# 同编号重复详情：一致合并 / 冲突待核实
+# ---------------------------------------------------------------------------
+
+
+def test_identical_duplicates_are_merged_and_all_urls_kept():
+    common = dict(
+        kind=NoticeKind.SUSPENSION,
+        published=f"2026-11-08T09:00:00{TZ}",
+        start=f"2026-11-10T06:00:00{TZ}",
+        end=f"2026-11-12T22:00:00{TZ}",
+    )
+    anns = [
+        make("A1", url="http://x/notices/A1.html", **common),
+        make("A1", url="http://x/notices/A1-dup.html", **common),
+    ]
+    res = reconstruct(anns, Q)
+    assert len(res.active) == 1
+    assert res.active[0].source_chain == ["A1"]
+    # 两个来源 URL 都保留
+    assert res.active[0].sources == [
+        "http://x/notices/A1-dup.html",
+        "http://x/notices/A1.html",
+    ]
+    # 内容一致：无冲突、无待核实
+    assert res.conflicts == []
+    assert res.pending == []
+
+
+def test_identical_duplicates_result_is_order_independent():
+    common = dict(
+        kind=NoticeKind.SUSPENSION,
+        published=f"2026-11-08T09:00:00{TZ}",
+        start=f"2026-11-10T06:00:00{TZ}",
+        end=f"2026-11-12T22:00:00{TZ}",
+    )
+    v1 = make("A1", url="http://x/notices/A1.html", **common)
+    v2 = make("A1", url="http://x/notices/A1-dup.html", **common)
+    r1 = reconstruct([v1, v2], Q)
+    r2 = reconstruct([v2, v1], Q)
+    assert r1.active[0].sources == r2.active[0].sources
+    assert r1.active[0].suspend_end == r2.active[0].suspend_end
+
+
+def test_conflicting_duplicate_marks_chain_pending_and_lists_sources():
+    anns = [
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-20T22:00:00{TZ}"),
+        make("A2", NoticeKind.CORRECTION, f"2026-11-09T15:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-15T22:00:00{TZ}",
+             refs=["A1"], url="http://x/notices/A2.html"),
+        make("A2", NoticeKind.CORRECTION, f"2026-11-09T15:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-18T22:00:00{TZ}",
+             refs=["A1"], url="http://x/notices/A2-alt.html"),
+    ]
+    res = reconstruct(anns, Q)
+
+    # 不输出该链的确定停运结论，也不进入失效链
+    assert res.active == []
+    assert res.inactive == []
+
+    assert len(res.pending) == 1
+    p = res.pending[0]
+    assert p.root_id == "A1"
+    assert p.chain == ["A1", "A2"]
+    assert p.conflict_notice_ids == ["A2"]
+    assert p.reason == "conflicting_duplicates"
+    assert set(p.sources) == {
+        "http://x/notices/A1.html",
+        "http://x/notices/A2.html",
+        "http://x/notices/A2-alt.html",
+    }
+
+    assert len(res.conflicts) == 1
+    c = res.conflicts[0]
+    assert c.notice_id == "A2"
+    assert c.conflicting_fields == ["suspend_end"]
+    assert {s.url for s in c.sources} == {
+        "http://x/notices/A2.html",
+        "http://x/notices/A2-alt.html",
+    }
+
+
+def test_conflict_result_does_not_depend_on_crawl_order():
+    base = dict(
+        kind=NoticeKind.SUSPENSION,
+        published=f"2026-11-08T09:00:00{TZ}",
+        start=f"2026-11-10T06:00:00{TZ}",
+    )
+    v1 = make("A1", end=f"2026-11-15T22:00:00{TZ}",
+              url="http://x/notices/A1.html", **base)
+    v2 = make("A1", end=f"2026-11-18T22:00:00{TZ}",
+              url="http://x/notices/A1-alt.html", **base)
+    r1 = reconstruct([v1, v2], Q)
+    r2 = reconstruct([v2, v1], Q)
+    assert r1.pending == r2.pending
+    assert r1.active == r2.active == []
+    assert r1.conflicts[0].conflicting_fields == ["suspend_end"]
+
+
+def test_conflict_on_root_taints_descendant_chain():
+    anns = [
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-07T09:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-20T22:00:00{TZ}",
+             url="http://x/notices/A1.html"),
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-07T09:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-21T22:00:00{TZ}",
+             url="http://x/notices/A1-alt.html"),
+        make("A2", NoticeKind.CORRECTION, f"2026-11-09T15:00:00{TZ}",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-15T22:00:00{TZ}",
+             refs=["A1"]),
+    ]
+    res = reconstruct(anns, Q)
+    assert res.active == []
+    assert len(res.pending) == 1
+    assert res.pending[0].chain == ["A1", "A2"]
+    assert res.pending[0].conflict_notice_ids == ["A1"]
+
+
+def test_duplicate_versions_pointing_to_different_originals_both_chains_pending():
+    anns = [
+        make("R1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}", route="70 路",
+             start=f"2026-11-11T06:00:00{TZ}", end=f"2026-11-13T20:00:00{TZ}"),
+        make("R2", NoticeKind.SUSPENSION, f"2026-11-08T09:30:00{TZ}", route="71 路",
+             start=f"2026-11-11T06:00:00{TZ}", end=f"2026-11-13T20:00:00{TZ}"),
+        make("C1", NoticeKind.CORRECTION, f"2026-11-10T12:00:00{TZ}", route="70 路",
+             start=f"2026-11-11T06:00:00{TZ}", end=f"2026-11-15T20:00:00{TZ}",
+             refs=["R1"], url="http://x/notices/C1.html"),
+        make("C1", NoticeKind.CORRECTION, f"2026-11-10T12:00:00{TZ}", route="70 路",
+             start=f"2026-11-11T06:00:00{TZ}", end=f"2026-11-15T20:00:00{TZ}",
+             refs=["R2"], url="http://x/notices/C1-alt.html"),
+    ]
+    res = reconstruct(anns, Q)
+
+    # 两份详情指向不同原公告：两边关联链都待核实
+    assert res.active == []
+    chains = {tuple(p.chain) for p in res.pending}
+    assert chains == {("R1", "C1"), ("R2", "C1")}
+    for p in res.pending:
+        assert p.conflict_notice_ids == ["C1"]
+        assert {s.url for s in p.conflicts[0].sources} == {
+            "http://x/notices/C1.html",
+            "http://x/notices/C1-alt.html",
+        }
+
+    # 冲突字段包含引用编号
+    c = res.conflicts[0]
+    assert c.notice_id == "C1"
+    assert "references" in c.conflicting_fields
+
+
+def test_independent_unrelated_notices_still_judged_normally():
+    anns = [
+        # 冲突链：60 路
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}", route="60 路",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-20T22:00:00{TZ}",
+             url="http://x/notices/A1.html"),
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}", route="60 路",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-21T22:00:00{TZ}",
+             url="http://x/notices/A1-alt.html"),
+        # 无关联的独立公告：12 路照常判定为有效
+        make("B1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}", route="12 路",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-12T22:00:00{TZ}"),
+        # 无关联的独立公告：18 路照常判定为过期
+        make("B2", NoticeKind.SUSPENSION, f"2026-11-03T14:00:00{TZ}", route="18 路",
+             start=f"2026-11-05T06:00:00{TZ}", end=f"2026-11-08T20:00:00{TZ}"),
+    ]
+    res = reconstruct(anns, Q)
+
+    assert len(res.pending) == 1
+    assert res.pending[0].chain == ["A1"]
+
+    assert len(res.active) == 1
+    assert res.active[0].route == "12 路"
+
+    assert len(res.inactive) == 1
+    assert res.inactive[0].root_id == "B2"
+    assert res.inactive[0].reason == "expired"
+
+
+def test_conflicting_duplicate_reports_each_compared_field():
+    anns = [
+        make("A1", NoticeKind.SUSPENSION, f"2026-11-08T09:00:00{TZ}", route="12 路",
+             start=f"2026-11-10T06:00:00{TZ}", end=f"2026-11-12T22:00:00{TZ}",
+             url="http://x/notices/A1.html"),
+        make("A1", NoticeKind.CORRECTION, f"2026-11-09T09:00:00{TZ}", route="13 路",
+             start=f"2026-11-10T07:00:00{TZ}", end=f"2026-11-13T22:00:00{TZ}",
+             url="http://x/notices/A1-alt.html"),
+    ]
+    res = reconstruct(anns, Q)
+    c = res.conflicts[0]
+    assert set(c.conflicting_fields) == {
+        "kind",
+        "route",
+        "suspend_start",
+        "suspend_end",
+        "published_at",
+    }
+    assert len(res.pending) == 1
+
+
+def test_reference_order_difference_is_not_a_conflict():
+    v1 = make("A2", NoticeKind.CORRECTION, f"2026-11-10T18:00:00{TZ}", route=None,
+              refs=["A1", "GHOST"], url="http://x/notices/A2.html")
+    v2 = make("A2", NoticeKind.CORRECTION, f"2026-11-10T18:00:00{TZ}", route=None,
+              refs=["GHOST", "A1"], url="http://x/notices/A2-alt.html")
+    res = reconstruct([v1, v2], Q)
+    assert res.conflicts == []
+    assert res.pending == []
